@@ -1,0 +1,257 @@
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(scales)
+library(MASS)     
+PATH_LCR_ALL   <- "./LRCRs_all_gc_ann_exon.bed"
+PATH_REMOVE    <- "./remove.bed"
+
+PATH_GENE_GC   <- "../genes_gc.txt" # GC of all genes 
+PATH_EXONS_MIN <- "./gencode.annotation_sorted.bed"
+
+PATH_EXONS_V35 <- "./gencode.v35_annotation_exon.bed"
+
+
+
+## 1) SCRIPT 1 — CLEAN LCR + gene/exon presence 
+LCR_all <- fread(PATH_LCR_ALL)
+
+# drop 
+LCR_all[, c("V18", "V19", "V20", "V21", "V23") := NULL]
+
+setnames(
+  LCR_all,
+  c(
+    "chr", "start", "end", "name", "depth", "length", "sample",
+    "batch", "mean_depth", "sd_depth", "z", "GC", "all_zero",
+    "class", "experiment", "key", "category", "exon_number"
+  )
+)
+
+# 1.2 remove Twsit uncovered intervalls 
+
+remove <- fread(PATH_REMOVE)
+setnames(remove, c("chr", "start", "end", "gene"))
+
+ov_clean <- LCR_all %>%
+  anti_join(remove, by = c("chr","start","end"))
+
+# 1.3 REGIONS-SAMPLE-SEQ 
+ov_unique <- ov_clean %>%
+  as_tibble() %>%
+  group_by(chr, start, end, sample, experiment, category) %>%
+  dplyr::slice(1L) %>%
+  ungroup() %>%
+  mutate(
+    exon_num = as.integer(str_extract(exon_number, "\\d+")),
+    compartment = ifelse(exon_num == 1, "exon1", "other")
+  )
+
+# 1.4 Plot gene-normalized: frazione geni con ≥1 LCR in exon1 vs other
+gene_presence_long <- ov_unique %>%
+  filter(!is.na(name), !is.na(category), !is.na(compartment)) %>%
+  distinct(category, gene = name, compartment) %>%
+  mutate(has_LCR = 1L)
+
+gene_presence_wide <- gene_presence_long %>%
+  pivot_wider(
+    names_from  = compartment,
+    values_from = has_LCR,
+    values_fill = 0
+  )
+
+plot_gene_norm <- gene_presence_wide %>%
+  pivot_longer(cols = c(exon1, other), names_to = "compartment", values_to = "has_LCR") %>%
+  group_by(category, compartment) %>%
+  summarise(pct = mean(has_LCR == 1), .groups = "drop") %>%
+  mutate(
+    category    = factor(category, levels = c("ES-only", "GS-only", "Shared")),
+    compartment = factor(compartment, levels = c("exon1", "other"))
+  )
+
+p_gene_norm <- ggplot(plot_gene_norm, aes(category, pct, fill = compartment)) +
+  geom_col(position = position_dodge(width = 0.8), color = "black", alpha = 0.9) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("exon1" = "#1f78b4", "other" = "#a6cee3")) +
+  labs(
+    title = "Gene-level LCR frequency by compartment",
+    subtitle = "Proportion of genes with ≥1 LCR in exon1 or other exons",
+    x = "Category", y = "Fraction of genes", fill = "Compartment"
+  ) +
+  theme_minimal(base_size = 15)
+
+print(p_gene_norm)
+
+
+## — gene_info + logistic gene-level
+
+#  Gene GC (CDS) da genes_gc.txt
+gc <- fread(PATH_GENE_GC, skip = 1, header = FALSE)
+setnames(gc, c("chr","start","end","gene",
+               "pct_at","pct_gc",
+               "num_A","num_C","num_G","num_T","num_N","num_oth","seq_len"))
+
+gene_gc <- gc[, .(
+  cds_len_bp = sum(seq_len),
+  gc = (sum(num_C) + sum(num_G)) / sum(seq_len)
+), by = gene]
+
+#   span bed con esoni ordinati
+exons_min <- fread(PATH_EXONS_MIN, header = FALSE)
+setnames(exons_min, c("chr","start","end","gene"))
+
+gene_span <- exons_min %>%
+  group_by(gene) %>%
+  summarise(
+    start_genomic = min(start),
+    end_genomic   = max(end),
+    genomic_span_bp = end_genomic - start_genomic,
+    .groups = "drop"
+  )
+
+gene_info <- gene_gc %>%
+  left_join(gene_span, by = "gene")
+
+# Dataset gene-level ( exon1/other) + covariate
+gene_level_wide <- gene_presence_wide %>%
+  left_join(gene_info, by = "gene")
+
+#  Modello logistico: probabilità gene abbia ≥1 LCR (exon1 vs other) aggiustato
+gene_level_long_for_glm <- gene_level_wide %>%
+  pivot_longer(
+    cols = c(exon1, other),
+    names_to = "compartment",
+    values_to = "has_LCR"
+  ) %>%
+  mutate(
+    compartment = factor(compartment, levels = c("exon1","other")),
+    category    = factor(category, levels = c("ES-only","GS-only","Shared")),
+    gc_scaled   = as.numeric(scale(gc)),
+    log_len     = as.numeric(scale(log(cds_len_bp)))
+  )
+
+fit_gene <- glm(
+  has_LCR ~ compartment + category + gc_scaled + log_len,
+  family = binomial(),
+  data = gene_level_long_for_glm
+)
+
+summary(fit_gene)
+
+OR_gene <- exp(coef(fit_gene))
+CI_gene <- exp(confint(fit_gene))
+cbind(OR_gene, CI_gene)
+
+
+
+##  — basepair-level overlap LCR×esoni + binomiale bp
+
+# 3.1 Exons GENCODEv35 (chr/start/end/gene/exon)
+exons_bed <- fread(PATH_EXONS_V35, header = FALSE)
+setnames(exons_bed, c("chr","start","end","gene","exon"))
+ex <- as.data.table(exons_bed)
+
+ex[, exon_num := as.integer(str_extract(exon, "\\d+"))]
+ex[, compartment := ifelse(exon_num == 1, "exon1", "other")]
+ex[, exon_len := end - start]
+
+# lunghezze coding per gene×compartment
+gene_len <- ex[, .(length_bp = sum(exon_len, na.rm = TRUE)), by = .(gene, compartment)]
+
+#  LCR uniche per regione + category + experiment (qui ignoriamo sample)
+lcr_u <- ov_unique %>%
+  dplyr::select(chr, start, end, category, experiment) %>%
+  distinct() %>%
+  as.data.table()
+
+# Overlap bp: LCR vs esoni
+setkey(ex, chr, start, end)
+setkey(lcr_u, chr, start, end)
+
+ov_bp <- foverlaps(lcr_u, ex, type = "any", nomatch = 0L)
+
+ov_bp[, lowcov_bp := pmax(0L, pmin(end, i.end) - pmax(start, i.start))]
+
+lowcov <- ov_bp[lowcov_bp > 0,
+                .(lowcov_bp = sum(lowcov_bp)),
+                by = .(gene, compartment, category, experiment)]
+
+#  gene×compartment×category×experiment
+genes <- unique(gene_len$gene)
+cats  <- unique(lcr_u$category)
+exps  <- unique(lcr_u$experiment)
+comps <- c("exon1","other")
+
+grid <- CJ(gene = genes, category = cats, experiment = exps, compartment = comps)
+
+df_bp <- merge(grid, gene_len, by = c("gene","compartment"), all.x = TRUE)
+df_bp <- merge(df_bp, lowcov,  by = c("gene","compartment","category","experiment"), all.x = TRUE)
+
+df_bp[is.na(lowcov_bp), lowcov_bp := 0L]
+df_bp <- df_bp[!is.na(length_bp) & length_bp > 0]
+
+# covariate gene-level
+gi <- as.data.table(gene_info)[, .(gene, gc, cds_len_bp, genomic_span_bp)]
+df_bp <- merge(df_bp, gi, by = "gene", all.x = TRUE)
+df_bp <- df_bp[!is.na(gc) & !is.na(cds_len_bp)]
+
+#  rate lowcov_bp / length_bp
+plot_df_bp <- df_bp[, .(rate = sum(lowcov_bp) / sum(length_bp)),
+                    by = .(category, experiment, compartment)]
+
+plot_df_bp[, compartment := factor(compartment, levels = c("exon1","other"))]
+plot_df_bp[, category := factor(category, levels = c("ES-only","GS-only","Shared"))]
+
+p_bp_rate <- ggplot(plot_df_bp,
+                    aes(x = category, y = rate, fill = compartment)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    color = "black",
+    alpha = 0.9
+  ) +
+  facet_wrap(~ experiment) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(
+    values = c("exon1" = "#1f78b4", "other" = "#a6cee3")
+  ) +
+  labs(
+    title = "Base-pair–level LCRs by coding compartment",
+    x = "SEQ METHODS",
+    y = "Fraction of coding bases",
+    #fill = "Compartment"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(size = 12)
+  )
+
+print(p_bp_rate)
+
+
+#  Modello binomiale sui bp: lowcov_bp su length_bp
+df_bp[, compartment := factor(compartment, levels = c("exon1","other"))]
+df_bp[, category    := factor(category, levels = c("ES-only","GS-only","Shared"))]
+df_bp[, experiment  := factor(experiment)]
+
+df_bp[, gc_scaled := as.numeric(scale(gc))]
+df_bp[, log_len_scaled := as.numeric(scale(log(cds_len_bp)))]
+
+fit_bp <- glm(
+  cbind(lowcov_bp, length_bp - lowcov_bp) ~
+    compartment * category +
+    compartment * experiment +
+    gc_scaled +
+    log_len_scaled,
+  family = binomial(),
+  data = df_bp
+)
+
+summary(fit_bp)
+
+OR_bp <- exp(coef(fit_bp))
+CI_bp <- exp(confint(fit_bp))
+cbind(OR_bp, CI_bp)
