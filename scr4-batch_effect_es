@@ -1,0 +1,250 @@
+library(readr)
+library(dplyr)
+library(purrr)
+library(GenomicRanges)
+library(ggplot2)
+library(pheatmap)
+library(VennDiagram)
+library(tidyr)
+
+
+#Row regions files obtained from mosdepth including all intervall and all coverage value 
+
+ES_full <- fread(".mosdepth/twist/results/ES_full_twist.txt", header=F, sep="\t", stringsAsFactors = F)
+colnames(ES_full) <- c("chr","start","end","name",
+    "depth","length","sample","batch","mean_depth","sd_depth","z","value", "LCR")
+#898.004 righe = n_intervalli × n_campioni circa 204.091 × 44 campioni
+
+ES_full <- ES_full[, -( (ncol(ES_full)-1) : ncol(ES_full) ) ]
+
+#coverage normalizzation each intervall with DoC > 20 beacome 20 
+
+ES_norm <- ES_full %>%
+    mutate(depth_norm = ifelse(depth > 20, 20, depth))
+
+regions_low_any <- ES_norm %>%
+    group_by(chr, start, end) %>%
+    summarise(any_low = any(depth_norm < 20), .groups = "drop") %>%
+    filter(any_low == TRUE)
+
+ES_sub <- ES_norm %>%
+    inner_join(regions_low_any, by=c("chr","start","end"))
+
+z_threshold <- 1.96
+
+
+#lower: se z <= –1.96 (copertura significativamente sotto la media del batch)
+#higher: se z >= 1.96
+#close: altrimenti quali regioni sono sistematicamente scarse nei batch quali regioni hanno problemi solo in alcuni campioni quali batch differiscono tra loro per LCR
+
+df_clean <- ES_sub %>%
+    mutate(
+        batch_mean = ave(depth_norm, batch, FUN = mean),
+        batch_sd   = ave(depth_norm, batch, FUN = sd),
+        z_score    = (depth_norm - batch_mean) / batch_sd,
+        
+        # deviation labels
+        deviation = case_when(
+            z_score <= -z_threshold ~ "lower",
+            z_score >=  z_threshold ~ "higher",
+            TRUE ~ "close"
+        ),
+        
+        deviation_numeric = case_when(
+            deviation == "lower"  ~ -1,
+            deviation == "higher" ~ 1,
+            TRUE ~ 0
+        ),
+        
+        # genomic region ID
+        region = paste(chr, start, end, sep = "_"),
+        
+        # define low_coverage (same rule used before)
+        low_coverage = deviation == "lower"
+    )
+
+df_regions <- df_clean %>%
+    dplyr::select(batch, sample, region, low_coverage)
+
+
+position_consistency <- df_regions %>%
+    dplyr::group_by(batch, region) %>%
+    dplyr::summarise(
+        total_samples = n_distinct(sample),
+        
+        consistent_low_coverage = n_distinct(low_coverage) == 1,
+        
+        inconsistent_samples = sum(low_coverage != dplyr::first(low_coverage)),
+        
+        .groups = "drop"
+    )
+
+
+
+## Summary per batch: consistent vs inconsistent
+
+
+batch_consistency_summary <- position_consistency %>%
+    group_by(batch) %>%
+    summarise(
+        consistent_positions = sum(consistent_low_coverage == TRUE),
+        inconsistent_positions = sum(consistent_low_coverage == FALSE),
+        total_positions = n(),
+        .groups = "drop"
+    )
+batch_consistency_summary_long <- batch_consistency_summary %>%
+    pivot_longer(cols = c(consistent_positions, inconsistent_positions),
+                 names_to = "type",
+                 values_to = "count")
+p2 <- ggplot(batch_consistency_summary_long,
+             aes(x = batch, y = count, fill = type)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    scale_fill_manual(values = c(
+        "consistent_positions" = "#66c2a5",
+        "inconsistent_positions" = "#fc8d62"
+    )) +
+    labs(
+        title = "Consistent vs Inconsistent Low-Coverage Positions per Batch",
+        x = "Batch",
+        y = "Number of Positions",
+        fill = "Position Type"
+    ) +
+    theme_minimal()
+p2
+
+ggsave(
+    "Figure5.png",
+    p2,
+    width = 7,
+    height = 6,
+    units = "in",
+    dpi = 600)
+
+library(VennDiagram)
+
+regions_by_batch <- df_clean %>%
+    filter(low_coverage == TRUE) %>%
+    group_by(batch) %>%
+    summarise(region = list(unique(region)), .groups = "drop")
+
+regions_list <- setNames(regions_by_batch$region, regions_by_batch$batch)
+
+df_clean <- df_clean %>%
+    mutate(low_coverage = deviation == "lower")
+batch_low_any <- df_clean %>%
+    group_by(batch, region) %>%
+    summarise(low_any = any(low_coverage), .groups = "drop") %>%
+    filter(low_any == TRUE)
+
+batch_low_any_count <- batch_low_any %>%
+    count(batch, name = "n_low_regions")
+
+batch_low_any_count
+batch_low_all <- df_clean %>%
+    group_by(batch, region) %>%
+    summarise(low_all = all(low_coverage), .groups = "drop") %>%
+    filter(low_all == TRUE)
+
+batch_low_all_count <- batch_low_all %>%
+    count(batch, name = "n_consistent_low_regions")
+
+batch_low_all_count
+low_list <- batch_low_any %>%
+    split(.$batch) %>%
+    lapply(function(x) x$region)
+
+library(VennDiagram)
+
+venn.plot <- venn.diagram(
+    x = low_list,
+    filename = NULL,
+    fill = c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3"),
+    alpha = 0.5,
+    cex = 1.2,
+    cat.cex = 1.3
+)
+
+grid::grid.newpage()
+grid::grid.draw(venn.plot)
+
+##### pca
+
+
+low_per_sample <- df_clean %>%
+    dplyr::group_by(sample, batch, region) %>%
+    dplyr::summarise(low = any(low_coverage), .groups="drop") %>%
+    dplyr::mutate(batch_sample = paste(batch, sample, sep="_"))
+
+mat <- low_per_sample %>%
+    dplyr::select(region, batch_sample, low) %>%
+    dplyr::mutate(low = as.numeric(low)) %>%
+    pivot_wider(names_from = batch_sample, values_from = low, values_fill = list(low=0))
+mat_t <- t(as.matrix(mat[,-1]))
+pca_res <- prcomp(mat_t, scale. = FALSE)
+plot(pca_res$x[,1], pca_res$x[,2], pch=19, col=factor(sub("_.*","", rownames(pca_res$x))))
+legend("topright", legend=unique(sub("_.*","", rownames(pca_res$x))), 
+       col=1:4, pch=19)
+
+tiff(
+    "Figure_PCA_baseR.tiff",
+    width = 10,
+    height = 6,
+    units = "in",
+    res = 600,
+    compression = "lzw"
+)
+
+plot(
+    pca_res$x[,1],
+    pca_res$x[,2],
+    pch = 19,
+    col = factor(sub("_.*","", rownames(pca_res$x))),
+    xlab = paste0("PC1 (", round(summary(pca_res)$importance[2,1]*100, 1), "%)"),
+    ylab = paste0("PC2 (", round(summary(pca_res)$importance[2,2]*100, 1), "%)"),
+    cex = 1.2
+)
+
+legend(
+    "topright",
+    legend = unique(sub("_.*","", rownames(pca_res$x))),
+    col = 1:4,
+    pch = 19,
+    cex = 1.1,
+    bty = "n"
+)
+
+dev.off()
+
+
+#Heatmap per verificare clustering per batch
+
+mat_heat <- mat[,-1]
+annot <- data.frame(batch = sub("_.*","", colnames(mat_heat)))
+rownames(annot) = colnames(mat_heat)
+
+pheatmap(mat_heat,
+         annotation_col = annot,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         clustering_distance_cols = "binary",
+         clustering_method="complete")
+#Statistica formale dell’effetto batch
+
+kruskal.test(z ~ batch, data = df_clean %>% filter(low_coverage==TRUE))
+#Kruskal-Wallis rank sum test
+#data:  z by batch
+#Kruskal-Wallis chi-squared = 619.93, df = 3, p-value < 2.2e-16
+
+pairwise.wilcox.test(df_clean$z[df_clean$low_coverage], df_clean$batch[df_clean$low_coverage], p.adjust="BH")
+
+#Pairwise comparisons using Wilcoxon rank sum test with continuity correction 
+#data:  df_clean$z[df_clean$low_coverage] and df_clean$batch[df_clean$low_coverage] 
+#       ce2020  ce2021  ce2022 
+#ce2021 < 2e-16 -       -      
+#ce2022 < 2e-16 0.32    -      
+#ce2023 < 2e-16 8.8e-13 1.9e-14
+#P value adjustment method: BH 
+ 
+
+
+
