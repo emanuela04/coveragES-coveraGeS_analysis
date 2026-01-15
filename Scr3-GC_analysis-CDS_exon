@@ -255,3 +255,98 @@ summary(fit_bp)
 OR_bp <- exp(coef(fit_bp))
 CI_bp <- exp(confint(fit_bp))
 cbind(OR_bp, CI_bp)
+
+
+
+#  Conteggi LCR per gene × category (unique per regione all’interno di gene)
+gene_counts <- ov_unique %>%
+  filter(!is.na(gene), gene != "", !is.na(category)) %>%
+  distinct(gene, chr, start, end, category) %>%   # un intervallo solo per campione 
+  count(gene, category, name = "n_LCR") %>%
+  pivot_wider(
+    names_from  = category,
+    values_from = n_LCR,
+    values_fill = 0
+  ) %>%
+  mutate(
+    total_LCR = (`ES-only` + `GS-only` + Shared),
+    vulnerability_index = (`ES-only` + `GS-only`) - Shared
+  )
+
+# GC e CDS length: gene, cds_len_bp, gc 
+
+gene_counts2 <- gene_counts %>%
+  dplyr::left_join(gene_info %>% 
+                     dplyr::select(gene, cds_len_bp, gc), by = "gene") %>%
+  dplyr::filter(!is.na(cds_len_bp), cds_len_bp > 0)
+
+# Armonizazzione x kb CDS
+gene_counts_norm <- gene_counts2 %>%
+  mutate(
+    cds_kb = cds_len_bp / 1000,
+    ES_rate     = `ES-only` / cds_kb,
+    GS_rate     = `GS-only` / cds_kb,
+    Shared_rate = Shared / cds_kb,
+    total_rate  = total_LCR / cds_kb
+  )
+
+
+gene_counts_long <- gene_counts_norm %>%
+  dplyr::select(gene, ES_rate, GS_rate, Shared_rate) %>%
+  pivot_longer(
+    cols = c(ES_rate, GS_rate, Shared_rate),
+    names_to = "category",
+    values_to = "rate"
+  ) %>%
+  dplyr::mutate(
+    category = recode(category,
+                      ES_rate = "ES-only",
+                      GS_rate = "GS-only",
+                      Shared_rate = "Shared"),
+    category = factor(category, levels = c("ES-only","GS-only","Shared"))
+  )
+
+# Top genes per rate totale
+top_genes_rate <- gene_counts_norm %>%
+  dplyr::arrange(desc(total_rate)) %>%
+  dplyr::slice(1:40) %>%
+  pull(gene)
+
+p_S2 <- gene_counts_long %>%
+  filter(gene %in% top_genes_rate) %>%
+  ggplot(aes(
+    x = rate,
+    y = reorder(gene, rate, FUN = sum),
+    fill = category
+  )) +
+  geom_col(color = "black", alpha = 0.9) +
+  labs(
+    title = "Figure S2 — Normalized LCRs per gene",
+    subtitle = "LCR rate per kb of coding sequence (top 40 genes by total rate)",
+    x = "LCRs per kb of CDS",
+    y = "Gene",
+    fill = "Category"
+  ) +
+  theme_minimal(base_size = 14)
+
+print(p_S2)
+
+
+ggsave("Figure_S2.png", plot = p_S2, width = 7, height = 6, units = "in", dpi = 600)
+
+# fraction  Quanta parte delle LCR totali sta nei top N geni?
+total_LCRs <- sum(gene_counts_norm$total_LCR, na.rm = TRUE)
+
+topN <- 100
+topN_df <- gene_counts_norm %>%
+  dplyr::arrange(desc(total_LCR)) %>%
+  dplyr::slice(1:topN)
+
+topN_LCRs <- sum(topN_df$total_LCR, na.rm = TRUE)
+fraction_topN <- topN_LCRs / total_LCRs
+
+cat("Fraction of all LCRs in top ", topN, " genes = ", round(fraction_topN, 4))
+
+
+# write.xlsx(gene_counts_norm, "gene_counts_norm.xlsx")
+
